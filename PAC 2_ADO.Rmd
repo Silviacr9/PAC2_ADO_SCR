@@ -1,0 +1,796 @@
+---
+title: "PAC_2 Analisis datos ómicos"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages 1 include=FALSE, message=FALSE}
+
+if(!require(airway)) BiocManager::install("airway")
+if(!require(Rsamtools)) BiocManager::install("Rsamtools")
+if(!require(GenomicFeatures)) BiocManager::install("GenomicFeatures")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(apeglm)) BiocManager::install("apeglm")
+if(!require(BiocParallel)) BiocManager::install("BiocParallel")
+if(!require(genefilter)) BiocManager::install("genefilter")
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+if(!require(AnnotationDbi)) BiocManager::install("AnnotationDbi")
+if(!require(ReportingTools)) BiocManager::install("ReportingTools")
+if(!require(RUVSeq)) BiocManager::install("RUVSeq")
+if(!require(sva)) BiocManager::install("sva")
+if(!require(Gviz)) BiocManager::install("Gviz")
+
+
+
+```
+
+
+## Abstract
+
+En este estudio se quería realizar un análisis de RNA-Seq de varias muestras obtenidas tras tres tipos de infiltración de tiroides:  
+• Not infiltrated tissues (NIT)
+• Small focal infiltrates (SFI)
+• Extensive lymphoid infiltrates (ELI)
+
+Los resultados muestran una sobreexpresión de varios genes del grupo ELI cuando se comparan con los genes del resto de grupos (NIT y SFI). También se analiza si el género de los individuos influencia esta sobreexpresión, con resultados poco concluyentes pero que parecen indicar que el género no afecta. 
+Finalmente, se busca la función biologica relacionada con los genes diferencialmente expresados, concluyendo que la mayoria estan relacionadas con una activación y regulación de la respuesta immunologica. 
+
+
+## Objetivos
+
+El objetivo de este estudio es comparar tres tipos de infiltración en el tiroides. La comparación se realizará sobre un total de 30 muestras. 
+
+## Materiales y métodos
+
+### Naturaleza de los datos, tipo estudio y diseño experimental
+
+Los datos de este estudio son datos de expresión (RNA-seq) pertenecientes a un análisis del tiroides en donde se compara tres tipos de infiltración medido en un total de 292 muestras pertenecientes a tres grupos:
+• Not infiltrated tissues (NIT): 236 samples
+• Small focal infiltrates (SFI): 42 samples
+• Extensive lymphoid infiltrates (ELI): 14 samples.
+
+Para este informe, se seleccionaran solamente 10 muestras aleatoriamente de cada grupo, tal y cómo se muestra en el código R siguiente: 
+
+```{r datos tiroides, echo=FALSE}
+
+library(openxlsx)
+
+targets <- read.csv("targets.csv")
+counts <- read.xlsx("counts.xlsx")
+
+```
+
+
+```{r muestras datos tiroides, message=FALSE}
+
+# Se divide el dataframe targets original en 3 sub-dataframes. De cada sub-dataframe se seleccionan 10 filas al azar:
+
+NIT <-subset(targets, Group=="NIT")
+aleatNIT <- sample(nrow(NIT),10, replace = FALSE)
+muestrasNIT <- NIT[aleatNIT, ]
+
+SFI <-subset(targets, Group=="SFI")
+aleatSFI <- sample(nrow(SFI),10, replace = FALSE)
+muestrasSFI <- SFI[aleatSFI, ]
+
+ELI <-subset(targets, Group=="ELI")
+aleatELI <-sample(nrow(ELI),10, replace = FALSE)
+muestrasELI <- ELI[aleatELI, ]
+
+# Finalmente, las muestras seleccionadas al azar para cada grupo se unen en un mismo dataframe (row=30 muestras):
+
+mtargets <- rbind(muestrasNIT, muestrasSFI, muestrasELI)
+nrow(mtargets)
+
+# Se crea un vector con todos los "Sample_Name" de las 30 muestras seleccionadas al azar: 
+
+SNm <- mtargets $Sample_Name
+
+# A partir de este vector, se seleccionan las columnas de la base de datos "counts":
+
+library(dplyr)
+
+mcounts <- select(counts, one_of(SNm))
+rownames(mcounts) <- counts[,1]
+ncol(mcounts)
+
+rownames(mcounts) <- gsub("\\..*", "", rownames(mcounts), fixed = FALSE)
+
+```
+
+Por lo tanto, después de la selección queda:
+
+• 10 muestras que corresponden al grupo control - tejidos no infiltrados
+• 10 muestras que corresponden al grupo de tratamiento1 - tejidos con infiltraciones focales
+• 10 muestras que corresponden al grupo de tratamiento2  - tejidos con infiltraciones extensas
+
+
+Se trata de un diseño experimental de 2 factores: 
+
+- Factor infiltración, con 3 niveles, los cuales son el tipo de infiltración.
+- Factor género, con dos niveles (hombre/mujer)
+
+Es un estudio de tipo comparativo(class comparison)
+
+
+
+
+### Metodos analisis
+Primeramente, a partir de la tabla con información de las 30 muestras seleccionadas aleatoriamente y la correspondiente matriz de counts, se construirá la DESeqDataSet para poder realizar todos los analisis pertinentes:   
+
+```{r dds, message=FALSE, echo=FALSE}
+
+library("DESeq2")
+
+ddsMat <- DESeqDataSetFromMatrix(countData = mcounts,
+                                  colData = mtargets,
+                                  design = ~ sex + Group)
+
+
+ddsMat
+
+```
+
+A continuación se describe el procedimiento de análisis que se ha seguido, paso por paso: 
+
+#### 1. Preprocesado de los datos: filtraje, transformación y visualización 
+
+El primer paso consiste en hacer un primer filtraje de la matriz de counts, ya que hay muchas filas que no contienen ninguna información. Por eso mismo las eliminaremos. Así pues, el objeto DESeqDataSet, una vez filtrado, se queda con las siguientes filas: 
+
+```{r pre-filtraje, echo=FALSE}
+
+ddsMat <- ddsMat[ rowSums(counts(ddsMat)) > 1, ]
+nrow(ddsMat)
+
+```
+Lo que significa que se han eliminado 12675 filas. 
+
+Cómo los datos no son homocedasticos, el siguiente paso es transformarlos para estabilizar la varianza a través de la media y poder realizar un buen analisis exploratorio. Aunque el paquete DESeq permite dos transformaciones (vst y rlog), solamente se utilizará la función vst ya que la base de datos se considera de medio tamaño (n=30). Los datos, una vez transformados quedan de la siguiente forma: 
+
+```{r transformación log2, echo=FALSE}
+
+vsd<-vst(ddsMat, blind = FALSE)
+
+head(assay(vsd))[,1:2]
+
+```
+
+Ahora que los datos ya se han transformado, podemos hacer una exploración de los datos a partir de gráficos, empezando por el boxplot:
+
+```{r boxplot, echo=FALSE}
+
+boxplot(assay(vsd),main="Boxplot muestras RNA-Seq ",names= paste( vsd$Group, vsd$sex, sep = " - " ), cex.axis=0.7, col= c(rep("green",10), rep("blue",10),rep("purple",10)),las=2, ylim=c(3,10))
+
+```
+Se observa que la distribución de los datos de las muestras (una vez transformados)es bastante similar.  
+
+Otro gráfico que ayuda a ver la similitud o dissimilitud entre muestras es el mapa de calor o heatmap: 
+
+```{r heatmap, echo=FALSE}
+
+sampleDists <- dist(t(assay(vsd)))
+
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( vsd$Group, vsd$sex, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+Con este "heatmap", se muestra un cluster jerarquico, basado en las distancias de las muestras. Lo que se observa es que las muestras no se dividen en tres clusteres diferentes según el grupo de tratamiento, sino que es más complejo y que hay relación entre grupos. 
+
+Con un gráfico PCA se puede ver la distribución de las muestras en los dos primeros componentes principales: 
+
+```{r PCA plot, echo=FALSE}
+
+plotPCA(vsd, intgroup = c("Group", "sex"))
+```
+Se observa que las muestras NIT se encuentran a la izquierda, seguidas de SFI y finalmente más a la derecha, las muestras ELI. 
+
+También se observa una distribución en el segundo componente según el género, las muestras de mujeres se encuentras más abajo y las muestras de hombre más arriba. 
+
+Finalmente, se realiza un escalado MDS para ver las distancias entre muestras: 
+
+```{r mds echo=FALSE}
+library(dplyr)
+library(ggplot2)
+
+mds <- as.data.frame(colData(vsd)) %>% 
+  cbind(cmdscale(sampleDistMatrix))
+
+ggplot(mds, aes(x = `1`, y = `2`, color = Group, shape = sex)) +
+  geom_point(size = 3) + coord_fixed()
+
+```
+
+De nuevo, se observa separación según grupo de tratamiento. No obstante, la separación por sexo no está tan clara. 
+
+#### 2. Identificación de genes diferencialmente expresados
+
+Todos los pasos del analisis de expresión diferencial se encuentran englobados en la función DESeq.
+
+Para ver los genes diferencialmente expresados entre cada par de grupos se utiliza la función results y se comparan dos a dos los grupos. Se define para todos un cut-off de p-valor de 0.05, ya que solamente se considera una fracción de 5% de falsos positivos aceptable. También se define un limite de log fold change de 1, es decir se quiere un cambio en la expresión de los genes de 2 (es decir, que los genes de los grupos con infiltración se expresen el doble comparado con el grupo control o comparado con el grupo con menos infiltración).
+
+**1) NIT vs SFI**
+
+```{r dds, echo=FALSE, message=FALSE}
+dds<- DESeq(ddsMat)
+```
+
+
+```{r NITvsSFI, echo=FALSE}
+res1 <- results(dds, alpha=0.05, lfcThreshold=1,contrast=c("Group","NIT","SFI"))
+res1
+```
+El resultado anterior muestra un listado de todos los genes y los parametros estadisticos obtenidos de la comparación entre grupos seleccionados (error estandard/estadistico de Wald/p-valor..). El p-valor indica si hay algun gen diferencialmente expresado entre los dichos grupos (p-valor< 0.05: gen diferencialmente expresado). 
+
+Se le puede pedir un resumen para ver cuantos genes se encuentran diferencialmente expresados entre grupos:
+
+```{r resumen res1, echo=FALSE}
+summary(res1)
+
+table(res1$padj < 0.05)
+```
+
+Se observa que la mayoria de genes diferencialmente expresados estan down-regulated. Esto significa que la mayoriade genes estan expresados a la mitad (o menos) en el grupo NIT en comparación al grupo SFI. 
+
+
+Para las dos otras comparaciones, se mostrará solamente el resumen de los resultados y el contaje de genes diferencialmente expresados:
+
+**2) NIT vs ELI**
+
+```{r NITvsELI, include=FALSE}
+res2 <- results(dds,alpha=0.05,lfcThreshold=1, contrast=c("Group","NIT","ELI"))
+
+res2
+```
+
+```{r resumen res2, echo=FALSE}
+summary(res2)
+
+table(res2$padj < 0.05)
+```
+Se observa que la mayoria de genes diferencialmente expresados estan down-regulated. Esto significa que la mayoria de genes estan expresados a la mitad (o menos) en el grupo NIT en comparación al grupo ELI. 
+
+
+**3) SFI vs ELI**
+
+```{r SFIvsELI, include=FALSE}
+res3 <- results(dds,alpha=0.05,lfcThreshold=1, contrast=c("Group","SFI","ELI"))
+
+res3
+```
+
+```{r resumen res2, echo=FALSE}
+summary(res3)
+
+table(res3$padj < 0.05)
+```
+
+Se observa que la mayoria de genes diferencialmente expresados estan down-regulated. Esto significa que la mayoria de genes estan expresados a la mitad (o menos) en el grupo SFI en comparación al grupo ELI. 
+
+Estos resultados conducen a la hipotesis de sobreexpresion de ciertos genes cuando se realiza una infiltración de tejidos, sobretodo cuando esta es extensa.  
+
+
+**4)MujeresvsHombres**
+
+Finalmente, se quiere ver si el factor de ser hombre o mujer puede influir de alguna forma en los resultados anteriores, es decir, si hay interacción entre estos dos factores. Se realizará una comparación dentro de cada grupo teniendo en cuenta los dos sexos diferentes:
+
+```{r interacción, echo=FALSE, message=FALSE}
+
+ddsMatint<- ddsMat
+ddsMatint$Group <- factor(paste0(ddsMat$Group, ddsMat$sex))
+design(ddsMatint) <- ~ Group
+ddsINT <- DESeq(ddsMatint)
+resint1 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "NITfemale", "NITmale"))
+resint2 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "SFIfemale", "SFImale"))
+resint3 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "ELIfemale", "ELImale"))
+
+summary(resint1)
+summary(resint2)
+summary(resint3)
+
+```
+
+Se observa que muy pocos genes se encuentran diferencialmente expresados dentro del mismo grupo cuando se comparan los diferentes sexos. Estos se podria deber a diferencias biologicas entre género, así que de entrada no se tendrá en cuenta el factor sexo para la posterior valoración de resultados y se concluirá que el sexo/género no influye en la busqueda de genes diferencialmente expresados entre los grupos de estudio. 
+
+## Resultados
+
+En el apartado de analisis y metodos: "Identificación de genes diferencialmente expresados", se encontraron varios genes diferencialmente expresados en las comparaciones entre grupos. En este apartado, se mostraran los  resultados gráficamente, cómo también se intentarán identificar los genes seleccionados,buscar patrones entre ellos y finalmente ver si estos genes tienen alguna función biologica en común. 
+Este apartado practicamente se basará en la comparación NIT vs ELI, en la cuál se han obtenido más genes diferencialmente expresados. Cómo no se ha encontrado demasiada diferencia entre NIT vs SFI, se obviará para el analisis de estos. 
+
+#### 1. Visualización de resultados
+
+El primer gráfico de visualización de resultados es un MA-plot, dónde se observa el log2 fold changes de los genes y se marca en azul los genes diferencialmente expresados(p-valor inferior a 0.05 y log2 fold change inferior o superior a 1 o -1). En este caso, se realiza para todas la comparaciones. 
+
+```{r MA-plot, echo=FALSE}
+
+plotMA(res1, main="MA plot NIT vs SFI")
+abline(h=c(-1,1), col="red")
+
+plotMA(res2, main="MA plot NIT vs ELI")
+abline(h=c(-1,1),col="red")
+
+plotMA(res3, main="MA plot SFI vs ELI")
+abline(h=c(-1,1),col="red")
+
+```
+Las lineas rojas marcan el valor de log fold change establecido previamente: -1 y 1. 
+
+Se observa que los genes diferencialmente expresados observados en estos gráficos coincide con los resultados obtenidos anteriormente. 
+
+A continuación, se realiza un grafico "plot count", dónde se selecciona un gen determinado y se mira el contaje de lecturas entre grupos de tratamiento. 
+
+Por ejemplo, se realiza este gráfico con los 5 genes con un p-valor más bajo de la comparación NIT vs ELI
+
+```{r plot counts,echo=FALSE}
+
+res2Ordered <- res2[order(res2$padj),]
+top5genes <- (res2Ordered)[1:5,]
+rownamestop5genes <- rownames(top5genes)
+
+
+plotCounts(dds, gene=(rownamestop5genes[1]), intgroup ="Group")
+plotCounts(dds, gene=(rownamestop5genes[2]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[3]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[4]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[5]), intgroup="Group")
+
+
+
+
+```
+Se observa la diferencia de contajes entre grupos, marcada por una sobreexpresión de estos genes en el grupo ELI en comparación con los otros dos. 
+Los gráficos también inducen a pensar que todos estos genes diferencialmente expresados en la comparación NIT vs ELI seguramente también estan expresados en la comparacion SFI vs ELI. 
+
+#### 2. Anotación de resultados
+
+Para la anotación de resultados solamente se utilizarán los resultados de la comparación NIT vs ELI. Se muestra la parte superior de la tabla de resultados con el nombre de los genes añadido:  
+
+```{r anotacion, echo=FALSE, message=FALSE}
+library("org.Hs.eg.db")
+library("AnnotationDbi")
+
+
+res2$symbol <- mapIds(org.Hs.eg.db,
+                     keys=rownames(res2),
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+res2$entrez <- mapIds(org.Hs.eg.db,
+                     keys=rownames(res2),
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+res2Ordered <- res2[order(res2$padj),]
+head(res2Ordered)
+
+
+```
+Así entonces, en la tabla anterior se le ha añadido el nombre del gen en base a ENSEMBL y por otra, se ha añadido el número de gen referente a entrez.
+
+#### 3. Busca de patrones de expresión y agrupación de las muestras 
+
+Se compararan cuantos genes diferencialmente expresados son comunes en las comparaciones NIT vs ELI y SFI vs ELI. 
+
+```{r comparacion multiple, echo=FALSE }
+gdecomp2 <-rownames(res2[which(res2$padj < 0.05),])
+gdecomp3 <-rownames(res3[which(res3$padj < 0.05),])
+intersectgenes <- intersect(gdecomp2 ,gdecomp3) 
+length(intersectgenes)
+
+```
+Se observa que la mayoría de los genes diferencialmente expresados en la comparación SFI vs ELI también lo estan en la comparación NIT vs ELI. No se buscará el nombre de todos estos genes, ya que supone una gran generación de datos. Así pues, se tiene otro soporte extra de que es suficiente utilizar solamente la comparación NIT vs ELI para la obtención de los resultados.
+
+A continuación se realizará un cluster y se mirará si hay agrupación entre genes/muestras. Solamente se seleccionaran los primeros 20 genes de la comparación NIT vs ELI con el p-valor más bajo. 
+
+```{r cluster resultados, echo=FALSE}
+
+library("genefilter")
+
+top20genes = head(res2Ordered,20)
+
+mat  <- assay(vsd)[rownames(top20genes), ]
+suffix <- seq(1:30)
+names1 <- paste("Sample",suffix, sep=" ")
+
+colnames(mat) <- names1
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("Group")])
+rownames(anno) <- colnames(mat)
+pheatmap(mat, annotation_col = anno)
+
+```
+
+A partir del gráfico anterior, se observa que hay dos clusteres principales para las muestras, uno de engloba  las muestras NIT y SFI, y otro que engloba las muestras ELI. Todos los genes utilizados se encuentran sobreexpresados en las muestras de ELI en comparación a los otros dos grupos de tratamiento. 
+Por lo que refiere a los genes, también se encuentran divididos en varios clusteres. 
+
+Si se quiere saber los nombres de los genes que forman cada clúster, se le pide al programa que muestre los simbolos de cada uno: 
+
+```{r nombres, echo=FALSE}
+
+top20names <- top20genes$symbol
+top20names
+
+```
+
+
+#### 4.Análisis de significación biológica (“Gene Enrichment Analysis”)
+
+A continuación se analizará si los genes diferencialmente expresados estan relacionados con alguna función biologica. 
+
+En primer lugar, se buscaran las vias biologicas relacionadas con GO de los 5 genes con un p-valor más bajo, solamente teniendo en cuenta los que se han relacionado con ENSEMBL o ENTREZ (se eliminan los NA):
+
+```{r GO. echo=FALSE}
+require(annotate) 
+
+top5genes <- (res2Ordered)[1:5,]
+
+top5genes <- na.omit(top5genes)
+
+
+GOAnots1 <- mget(top5genes$entrez, org.Hs.egGO) 
+for (i in 1:length(GOAnots1)) 
+{ for (j in 1:length(GOAnots1[[i]])) 
+{ GOAnot <- GOAnots1[[i]][[j]][[1]]
+    cat(top5genes$entrez[i],top5genes$symbol[i],GOAnot,substr(Term(GOAnot),1,30), "\n") 
+} 
+  }
+```
+Tal y cómo se vió en la PEC anterior, se produce  una lista larga de funciones biologicas para cada gen, por lo que a continuación se realizará un analisis de enriquecimiento con la función goseq() con los genes diferencialmente expresados obtenidos en la segunda comparación (res2 --> NIT vs ELI): 
+
+```{r library analisis , include=FALSE}
+
+library(goseq)
+library(stringr)
+ supportedOrganisms()[supportedOrganisms()$Genome=="hg19",]
+```
+
+Para ejecutar la función goseq, primero se necesita dar una ponderación a cada gen , dependiendo de su longitud. Se realiza a partir de la función pwf. Se muestra el principio de la tabla generada con pwf a continuación:
+
+```{r pwf, message=FALSE, echo=FALSE}
+
+res2$ENSEMBL <- rownames(res2)
+isSigGene <- res2$padj <= 0.05 & !is.na(res2$padj)
+genes <- as.integer(isSigGene)
+names(genes) <- res2$ENSEMBL
+
+pwf <- nullp(genes, "hg19","ensGene")
+head(pwf)
+
+```
+
+Una vez se tiene ponderación para cada gen, ya se puede ejecutar la función goseq(), que nos relaciona cada gen con su función ontologica: 
+```{r goseq, message=FALSE, echo=FALSE}
+
+goseq_res <- goseq(pwf, "hg19","ensGene",test.cats="GO:BP")
+
+head(goseq_res)
+```
+Finalmente, se puede representar en un gráfico las 10 funciones más relacionadas con los genes diferencialmente expresados obtenidos: 
+
+```{r plot go results, echo=FALSE}
+
+library(ggplot2)
+library(dplyr)
+goseq_res %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count")
+```
+
+Se observa que la mayoría de las funciones relacionadas con los genes diferencialmente expresados del grupo ELI se refieren a la activación y regulación de la respuesta immunologica. 
+
+## Discusión
+
+En este caso no se ha realizado un procedimiento de normalización previo al análisis de los datos, ya que se consideró que la normalización interna que lleva a cabo la función DESeq ya era suficiente. 
+De esta forma, se estableció un "logfold change threshold" de 1 y -1 y un "p-value" de 0.05 para seleccionar los genes diferencialmente expresados. Se considera que estos limites son restrictivos pero no demasiado, lo que se considera aceptable para este caso, el cuál no se ha realizado normalización previa activamente. 
+
+En caso de realizar normalización previa estos parametros deberian ser aún más restrictivos. 
+
+
+## Bibliografia 
+
+https://bioinformatics-core-shared-training.github.io/cruk-summer-school-2018/RNASeq2018/html/06_Gene_set_testing.nb.html#go-enrichment-analysis
+
+https://bioconductor.org/packages/devel/bioc/vignettes/goseq/inst/doc/goseq.pdf
+
+http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+https://chipster.csc.fi/manual/deseq2.html
+
+
+
+## Apendice
+
+A continuación, se muestra el código R utilizado para generar el anterior informe (y que no se había mostrado anteriormente):
+
+```{r packages, eval=FALSE}
+if(!require(airway)) BiocManager::install("airway")
+if(!require(Rsamtools)) BiocManager::install("Rsamtools")
+if(!require(GenomicFeatures)) BiocManager::install("GenomicFeatures")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(apeglm)) BiocManager::install("apeglm")
+if(!require(BiocParallel)) BiocManager::install("BiocParallel")
+if(!require(genefilter)) BiocManager::install("genefilter")
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+if(!require(AnnotationDbi)) BiocManager::install("AnnotationDbi")
+if(!require(ReportingTools)) BiocManager::install("ReportingTools")
+if(!require(RUVSeq)) BiocManager::install("RUVSeq")
+if(!require(sva)) BiocManager::install("sva")
+if(!require(Gviz)) BiocManager::install("Gviz")
+```
+
+```{r datos 1, eval=FALSE}
+
+library(openxlsx)
+
+targets <- read.csv("targets.csv")
+counts <- read.xlsx("counts.xlsx")
+
+```
+
+```{r dds 1, eval=FALSE}
+library("DESeq2")
+ddsMat <- DESeqDataSetFromMatrix(countData = mcounts,
+                                  colData = mtargets,
+                                  design = ~ sex + Group)
+
+
+ddsMat
+```
+
+```{r pre-filtraje 1, eval=FALSE}
+ddsMat <- ddsMat[ rowSums(counts(ddsMat)) > 1, ]
+nrow(ddsMat)
+```
+
+```{r transformación log2 1, eval=FALSE}
+
+vsd<-vst(ddsMat, blind = FALSE)
+head(assay(vsd))[,1:2]
+```
+
+```{r boxplot 1, eval=FALSE}
+boxplot(assay(vsd),main="Boxplot muestras RNA-Seq ",names= paste( vsd$Group, vsd$sex, sep = " - " ), cex.axis=0.7, col= c(rep("green",10), rep("blue",10),rep("purple",10)),las=2, ylim=c(3,10))
+```
+
+
+```{r heatmap 1, eval=FALSE}
+sampleDists <- dist(t(assay(vsd)))
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( vsd$Group, vsd$sex, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+
+```{r PCA plot 1, eval=FALSE}
+plotPCA(vsd, intgroup = c("Group", "sex"))
+```
+
+```{r mds 1, eval=FALSE}
+library(dplyr)
+library(ggplot2)
+mds <- as.data.frame(colData(vsd)) %>% 
+  cbind(cmdscale(sampleDistMatrix))
+
+ggplot(mds, aes(x = `1`, y = `2`, color = Group, shape = sex)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+
+```{r dds 1, eval=FALSE}
+dds<- DESeq(ddsMat)
+```
+
+
+```{r NITvsSFI 1, eval=FALSE}
+res1 <- results(dds, alpha=0.05, lfcThreshold=1,contrast=c("Group","NIT","SFI"))
+res1
+```
+
+
+```{r resumen res1 1, eval=FALSE}
+summary(res1)
+
+table(res1$padj < 0.05)
+```
+
+```{r NITvsELI 1, eval=FALSE}
+res2 <- results(dds,alpha=0.05,lfcThreshold=1, contrast=c("Group","NIT","ELI"))
+
+res2
+```
+
+```{r resumen res2 1, eval=FALSE}
+summary(res2)
+
+table(res2$padj < 0.05)
+```
+
+```{r SFIvsELI 1, eval=FALSE}
+res3 <- results(dds,alpha=0.05,lfcThreshold=1, contrast=c("Group","SFI","ELI"))
+
+res3
+```
+
+```{r resumen res2 1, eval=FALSE}
+summary(res3)
+
+table(res3$padj < 0.05)
+```
+
+```{r interacción 1, eval=FALSE}
+
+ddsMatint<- ddsMat
+ddsMatint$Group <- factor(paste0(ddsMat$Group, ddsMat$sex))
+design(ddsMatint) <- ~ Group
+ddsINT <- DESeq(ddsMatint)
+resint1 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "NITfemale", "NITmale"))
+resint2 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "SFIfemale", "SFImale"))
+resint3 <- results(ddsINT,alpha=0.05,lfcThreshold=1, contrast=c("Group", "ELIfemale", "ELImale"))
+
+summary(resint1)
+summary(resint2)
+summary(resint3)
+```
+
+```{r MA-plot 1, eval=FALSE}
+
+plotMA(res1, main="MA plot NIT vs SFI")
+abline(h=c(-1,1), col="red")
+
+plotMA(res2, main="MA plot NIT vs ELI")
+abline(h=c(-1,1),col="red")
+
+plotMA(res3, main="MA plot SFI vs ELI")
+abline(h=c(-1,1),col="red")
+
+```
+
+```{r plot counts 1,eval=FALSE}
+
+res2Ordered <- res2[order(res2$padj),]
+top5genes <- (res2Ordered)[1:5,]
+rownamestop5genes <- rownames(top5genes)
+
+plotCounts(dds, gene=(rownamestop5genes[1]), intgroup ="Group")
+plotCounts(dds, gene=(rownamestop5genes[2]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[3]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[4]), intgroup="Group")
+plotCounts(dds, gene=(rownamestop5genes[5]), intgroup="Group")
+
+```
+
+```{r anotacion 1, eval=FALSE}
+library("org.Hs.eg.db")
+library("AnnotationDbi")
+res2$symbol <- mapIds(org.Hs.eg.db,
+                     keys=rownames(res2),
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+res2$entrez <- mapIds(org.Hs.eg.db,
+                     keys=rownames(res2),
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+res2Ordered <- res2[order(res2$padj),]
+head(res2Ordered)
+```
+
+```{r comparacion multiple 1, eval=FALSE }
+gdecomp2 <-rownames(res2[which(res2$padj < 0.05),])
+gdecomp3 <-rownames(res3[which(res3$padj < 0.05),])
+intersectgenes <- intersect(gdecomp2 ,gdecomp3) 
+length(intersectgenes)
+
+```
+
+```{r cluster resultados 1, eval=FALSE}
+library("genefilter")
+top20genes = head(res2Ordered,20)
+mat  <- assay(vsd)[rownames(top20genes), ]
+suffix <- seq(1:30)
+names1 <- paste("Sample",suffix, sep=" ")
+
+colnames(mat) <- names1
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("Group")])
+rownames(anno) <- colnames(mat)
+pheatmap(mat, annotation_col = anno)
+```
+
+```{r nombres 1, eval=FALSE}
+
+top20names <- top20genes$symbol
+top20names
+
+```
+
+```{r GO 1 eval=FALSE}
+require(annotate) 
+
+top5genes <- (res2Ordered)[1:5,]
+
+top5genes <- na.omit(top5genes)
+
+
+GOAnots1 <- mget(top5genes$entrez, org.Hs.egGO) 
+for (i in 1:length(GOAnots1)) 
+{ for (j in 1:length(GOAnots1[[i]])) 
+{ GOAnot <- GOAnots1[[i]][[j]][[1]]
+    cat(top5genes$entrez[i],top5genes$symbol[i],GOAnot,substr(Term(GOAnot),1,30), "\n") 
+} 
+  }
+```
+
+```{r library analisis 1 , eval=FALSE}
+
+library(goseq)
+library(stringr)
+ supportedOrganisms()[supportedOrganisms()$Genome=="hg19",]
+```
+
+
+```{r pwf 1, eval=FALSE}
+
+res2$ENSEMBL <- rownames(res2)
+isSigGene <- res2$padj <= 0.05 & !is.na(res2$padj)
+genes <- as.integer(isSigGene)
+names(genes) <- res2$ENSEMBL
+
+pwf <- nullp(genes, "hg19","ensGene")
+head(pwf)
+
+```
+
+
+```{r goseq 1, message=FALSE, eval=FALSE}
+
+goseq_res <- goseq(pwf, "hg19","ensGene",test.cats="GO:BP")
+
+head(goseq_res)
+```
+
+
+```{r plot go results 1, eval=FALSE}
+
+library(ggplot2)
+library(dplyr)
+goseq_res %>% 
+    top_n(10, wt=-over_represented_pvalue) %>% 
+    mutate(hitsPerc=numDEInCat*100/numInCat) %>% 
+    ggplot(aes(x=hitsPerc, 
+               y=term, 
+               colour=over_represented_pvalue, 
+               size=numDEInCat)) +
+        geom_point() +
+        expand_limits(x=0) +
+        labs(x="Hits (%)", y="GO term", colour="p value", size="Count")
+```
